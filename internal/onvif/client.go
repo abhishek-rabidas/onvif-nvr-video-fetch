@@ -31,6 +31,7 @@ const (
 	nsSchema    = "http://www.onvif.org/ver10/schema"
 )
 
+// Client talks to one NVR. Call SyncTime, then DiscoverServices, before other methods.
 type Client struct {
 	host string
 	port int
@@ -41,9 +42,11 @@ type Client struct {
 	httpAuth *digest.Auth
 	skew     time.Duration // device UTC clock - local clock, used for WS-Security Created
 
+	// Service endpoints. DeviceURL is the standard ONVIF path; the rest come from DiscoverServices.
 	DeviceURL, RecordingURL, SearchURL, ReplayURL string
 }
 
+// New returns a client for the NVR's ONVIF HTTP endpoint at host:port.
 func New(host string, port int, user, pass string) *Client {
 	return &Client{
 		host: host, port: port, user: user, pass: pass,
@@ -67,6 +70,9 @@ type Recording struct {
 
 // ---------------------------------------------------------------- SOAP plumbing
 
+// envelope wraps body in a SOAP 1.2 envelope. If secure, adds a WS-Security UsernameToken
+// with PasswordDigest = Base64(SHA1(nonce + created + password)); created uses the device
+// clock (local time + skew) because NVRs reject tokens outside a small time window.
 func (c *Client) envelope(body string, secure bool) string {
 	var hdr string
 	if secure {
@@ -105,6 +111,8 @@ func (c *Client) call(ctx context.Context, endpoint, body string, secure bool, o
 		if err != nil {
 			return err
 		}
+		// On 401: retry (at most twice) with HTTP auth, and WS-Security too in case the
+		// call was unauthenticated. The challenge is kept for later calls.
 		if resp.StatusCode == http.StatusUnauthorized && attempt < 2 {
 			if ch, err := digest.ParseBest(resp.Header.Values("WWW-Authenticate")); err == nil {
 				c.httpAuth.SetChallenge(ch)
@@ -112,6 +120,7 @@ func (c *Client) call(ctx context.Context, endpoint, body string, secure bool, o
 				continue
 			}
 		}
+		// Decode even on non-200: SOAP faults usually come with HTTP 400/500.
 		fault, err := decode(data, out)
 		switch {
 		case fault != nil:
@@ -125,6 +134,7 @@ func (c *Client) call(ctx context.Context, endpoint, body string, secure bool, o
 	}
 }
 
+// soapFault covers both SOAP 1.2 (Code/Reason) and SOAP 1.1 (faultstring) faults.
 type soapFault struct {
 	Code struct {
 		Value   string `xml:"Value"`
@@ -141,9 +151,11 @@ func (f *soapFault) Error() string {
 	return fmt.Sprintf("SOAP fault %s %s: %s", f.Code.Value, f.Code.Subcode.Value, msg)
 }
 
-// decode decodes the first element inside soap:Body into out.
+// decode decodes the first element inside soap:Body into out (or returns it as a fault).
+// Elements are matched by local name only, since vendors use arbitrary namespace prefixes.
 func decode(data []byte, out any) (*soapFault, error) {
 	d := xml.NewDecoder(bytes.NewReader(data))
+	// encoding/xml rejects non-UTF-8 charset declarations; treat the bytes as-is.
 	d.CharsetReader = func(_ string, r io.Reader) (io.Reader, error) { return r, nil }
 	inBody := false
 	for {
@@ -176,6 +188,7 @@ func decode(data []byte, out any) (*soapFault, error) {
 	}
 }
 
+// esc XML-escapes s for embedding in a request body.
 func esc(s string) string {
 	var b strings.Builder
 	_ = xml.EscapeText(&b, []byte(s))
@@ -184,11 +197,13 @@ func esc(s string) string {
 
 // ---------------------------------------------------------------- device service
 
+// onvifDateTime is the tt:DateTime structure (separate Date and Time elements).
 type onvifDateTime struct {
 	Date struct{ Year, Month, Day int }
 	Time struct{ Hour, Minute, Second int }
 }
 
+// utc returns the fields as-is in a UTC time.Time (no zone conversion), or zero if absent.
 func (d onvifDateTime) utc() time.Time {
 	if d.Date.Year == 0 {
 		return time.Time{}
@@ -218,6 +233,8 @@ func (c *Client) SyncTime(ctx context.Context) (offset time.Duration, tz string,
 	if local.IsZero() {
 		return 0, sdt.TimeZone.TZ, false, nil
 	}
+	// Offset = local − UTC wall clock. The POSIX TZ string isn't parsed (formats vary by
+	// vendor); rounding to 15 min absorbs seconds ticking between the two readings.
 	return local.Sub(utc).Round(15 * time.Minute), sdt.TimeZone.TZ, true, nil
 }
 
@@ -239,6 +256,7 @@ func (c *Client) DiscoverServices(ctx context.Context) error {
 			}
 		}
 	}
+	// GetCapabilities: older (pre-2.x) devices, or GetServices failed/omitted Replay.
 	if c.ReplayURL == "" {
 		var capab struct {
 			Ext struct {
@@ -263,6 +281,7 @@ func (c *Client) DiscoverServices(ctx context.Context) error {
 
 // fixXAddr points service URLs at the address the user reached the NVR on
 // (NVRs often advertise an internal IP/port when accessed through NAT).
+// HTTPS XAddrs are left unchanged: the user-supplied port is the HTTP one.
 func (c *Client) fixXAddr(xaddr string) string {
 	xaddr = strings.TrimSpace(xaddr)
 	u, err := url.Parse(xaddr)
@@ -308,6 +327,7 @@ func (c *Client) Recordings(ctx context.Context) ([]Recording, error) {
 	return c.findRecordings(ctx)
 }
 
+// recordingInformation is tt:RecordingInformation from the Search service.
 type recordingInformation struct {
 	RecordingToken    string
 	Source            struct{ SourceId, Name, Description string }
@@ -315,17 +335,20 @@ type recordingInformation struct {
 	LatestRecording   string
 }
 
+// findRecordings lists recordings via an asynchronous Search session:
+// FindRecordings → poll GetRecordingSearchResults until Completed → EndSearch.
 func (c *Client) findRecordings(ctx context.Context) ([]Recording, error) {
 	var fr struct{ SearchToken string }
 	if err := c.call(ctx, c.SearchURL, `<FindRecordings xmlns="`+nsSearch+`"><Scope/><KeepAliveTime>PT30S</KeepAliveTime></FindRecordings>`, true, &fr); err != nil {
 		return nil, fmt.Errorf("FindRecordings: %w", err)
 	}
 	tok := esc(strings.TrimSpace(fr.SearchToken))
+	// Release the search session even if ctx was cancelled (NVRs allow only a few at once).
 	defer c.call(context.WithoutCancel(ctx), c.SearchURL, `<EndSearch xmlns="`+nsSearch+`"><SearchToken>`+tok+`</SearchToken></EndSearch>`, true, nil)
 
 	var recs []Recording
-	seen := map[string]bool{}
-	for i := 0; i < 20; i++ {
+	seen := map[string]bool{} // some NVRs repeat results across polls
+	for i := 0; i < 20; i++ { // bounded: some NVRs never report Completed
 		var r struct {
 			State string                 `xml:"ResultList>SearchState"`
 			Info  []recordingInformation `xml:"ResultList>RecordingInformation"`
@@ -365,6 +388,8 @@ func (c *Client) RecordingRange(ctx context.Context, token string) (earliest, la
 	return parseXSDateTime(r.Info.EarliestRecording), parseXSDateTime(r.Info.LatestRecording), nil
 }
 
+// parseXSDateTime parses an xs:dateTime; values without a zone are taken as UTC.
+// Returns zero on failure.
 func parseXSDateTime(s string) time.Time {
 	s = strings.TrimSpace(s)
 	for _, layout := range []string{time.RFC3339Nano, "2006-01-02T15:04:05.999999999"} {

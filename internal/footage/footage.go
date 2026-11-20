@@ -18,6 +18,7 @@ import (
 	"com.flipkart.nvrvms/internal/rtspproxy"
 )
 
+// Request describes one footage fetch. List uses only the connection fields.
 type Request struct {
 	Host     string
 	Port     int
@@ -42,8 +43,10 @@ type Request struct {
 // ErrInvalid marks errors caused by bad request parameters (vs. NVR/network failures).
 var ErrInvalid = errors.New("invalid request")
 
+// timeLayouts are the accepted Start/End formats, tried in order.
 var timeLayouts = []string{"2006-01-02 15:04:05", "2006-01-02T15:04:05", "2006-01-02 15:04"}
 
+// parseLocal parses a wall-clock time string as a time in loc.
 func parseLocal(s string, loc *time.Location) (time.Time, error) {
 	for _, l := range timeLayouts {
 		if t, err := time.ParseInLocation(l, strings.TrimSpace(s), loc); err == nil {
@@ -53,12 +56,15 @@ func parseLocal(s string, loc *time.Location) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("%w: time %q (use YYYY-MM-DD HH:MM:SS)", ErrInvalid, s)
 }
 
+// connect opens an ONVIF session: syncs the NVR clock (needed for WS-Security),
+// picks the timezone for Start/End, and discovers the Profile G service endpoints.
 func connect(ctx context.Context, r *Request) (*onvif.Client, *time.Location, error) {
 	c := onvif.New(r.Host, r.Port, r.Username, r.Password)
 	offset, tz, ok, err := c.SyncTime(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
+	// Timezone precedence: explicit TZ > NVR's reported UTC offset > this machine's zone.
 	var loc *time.Location
 	switch {
 	case r.TZ != "":
@@ -89,6 +95,10 @@ func List(ctx context.Context, r Request) ([]onvif.Recording, error) {
 	return c.Recordings(ctx)
 }
 
+// Fetch downloads r.Start..r.End of one recording into r.Output (MP4):
+// ONVIF discovery → resolve channel to recording token → GetReplayUri →
+// local RTSP proxy (adds ONVIF replay headers) → ffmpeg remux.
+// Errors caused by bad parameters wrap ErrInvalid.
 func Fetch(ctx context.Context, r Request) error {
 	if r.Log == nil {
 		r.Log = log.Default()
@@ -135,6 +145,7 @@ func Fetch(ctx context.Context, r Request) error {
 		r.Log.Printf("channel %d → recording %q (source %q)", r.Channel, token, recs[r.Channel-1].SourceName)
 	}
 
+	// Sanity check only: warn (don't fail) since NVRs don't all report ranges reliably.
 	if earliest, latest, err := c.RecordingRange(ctx, token); err == nil && !earliest.IsZero() {
 		if end.Before(earliest) || (!latest.IsZero() && start.After(latest)) {
 			r.Log.Printf("warning: requested range is outside available footage (%s → %s)", earliest.In(loc).Format(time.RFC3339), latest.In(loc).Format(time.RFC3339))
@@ -166,13 +177,18 @@ func Fetch(ctx context.Context, r Request) error {
 		args = append(args, "-stats")
 	}
 	cmd := exec.CommandContext(ctx, ffmpeg, append(args,
+		// TCP interleaved transport (the proxy only relays the RTSP connection, not UDP).
+		// -timeout is the socket I/O timeout in µs (30s) in ffmpeg ≥5.
 		"-rtsp_transport", "tcp", "-timeout", "30000000",
 		"-i", proxy.URL(),
+		// Cap output length: some NVRs keep streaming past the requested end.
 		"-t", fmt.Sprintf("%.3f", dur.Seconds()),
+		// First video stream; first audio stream only if present ("?").
 		"-map", "0:v:0", "-map", "0:a:0?",
 		"-c:v", "copy", "-c:a", "aac", // NVR audio is usually G.711, which MP4 cannot carry
 		"-avoid_negative_ts", "make_zero", "-movflags", "+faststart",
 		r.Output)...)
+	// Keep the end of ffmpeg's stderr so failures carry its actual error message.
 	tail := &tailBuffer{max: 4 << 10}
 	cmd.Stderr = tail
 	if r.Stderr != nil {
@@ -194,6 +210,7 @@ func Fetch(ctx context.Context, r Request) error {
 		}
 		return fmt.Errorf("ffmpeg: %w: %s", err, tail.lastLines(3))
 	}
+	// ffmpeg can exit 0 without writing anything if the NVR sent no media.
 	if fi, err := os.Stat(r.Output); err != nil || fi.Size() == 0 {
 		return errors.New("ffmpeg produced no output (no footage for this range?)")
 	}
@@ -230,6 +247,7 @@ func (t *tailBuffer) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+// lastLines returns the last n non-empty lines joined by " | " (ffmpeg progress uses \r).
 func (t *tailBuffer) lastLines(n int) string {
 	lines := strings.FieldsFunc(string(t.b), func(r rune) bool { return r == '\n' || r == '\r' })
 	return strings.Join(lines[max(0, len(lines)-n):], " | ")

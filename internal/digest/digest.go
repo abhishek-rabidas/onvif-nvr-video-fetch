@@ -39,6 +39,8 @@ func ParseBest(values []string) (*Challenge, error) {
 	return basic, nil
 }
 
+// parseParams parses `key=value, key="quoted \"value\""` auth parameters.
+// Keys are lower-cased; quoted values are unescaped.
 func parseParams(s string) map[string]string {
 	m := map[string]string{}
 	for {
@@ -78,10 +80,11 @@ type Auth struct {
 
 	mu     sync.Mutex
 	ch     *Challenge
-	nc     uint32
+	nc     uint32        // nonce count, incremented per request when qop=auth
 	cnonce func() string // test hook
 }
 
+// SetChallenge installs a new server challenge (e.g. after a 401) and resets the nonce count.
 func (a *Auth) SetChallenge(c *Challenge) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -101,6 +104,7 @@ func (a *Auth) Authorization(method, uri string) string {
 	p := a.ch.Params
 	algo := p["algorithm"]
 	upper := strings.ToUpper(algo)
+	// MD5 unless the server asked for SHA-256 (RFC 7616); "-sess" variants handled below.
 	newHash := md5.New
 	if strings.HasPrefix(upper, "SHA-256") {
 		newHash = sha256.New
@@ -118,6 +122,8 @@ func (a *Auth) Authorization(method, uri string) string {
 	}
 	ha2 := h(method + ":" + uri)
 
+	// Only qop=auth is supported (auth-int would need the body hash); without it,
+	// fall back to the legacy RFC 2069 response that many NVRs still use.
 	qop := ""
 	for _, q := range strings.Split(p["qop"], ",") {
 		if strings.TrimSpace(q) == "auth" {
@@ -149,12 +155,14 @@ func hexHash(newHash func() hash.Hash, s string) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
+// randomHex returns a random 16-char hex client nonce.
 func randomHex() string {
 	b := make([]byte, 8)
 	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
 }
 
+// quote escapes a value for use inside a quoted-string header parameter.
 func quote(s string) string {
 	return strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(s)
 }

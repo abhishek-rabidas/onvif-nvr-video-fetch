@@ -8,11 +8,12 @@ import (
 	"strings"
 )
 
+// header is one RTSP header line; names are compared case-insensitively.
 type header struct{ k, v string }
 
 // message is an RTSP request or response; header order is preserved.
 type message struct {
-	first   string
+	first   string // request line or status line
 	headers []header
 	body    []byte
 }
@@ -34,7 +35,7 @@ func readMessage(r *bufio.Reader) (frame []byte, m *message, err error) {
 		return frame, nil, err
 	}
 	m = &message{}
-	for m.first == "" {
+	for m.first == "" { // skip stray blank lines between messages
 		if m.first, err = readLine(r); err != nil {
 			return nil, nil, err
 		}
@@ -60,6 +61,7 @@ func readMessage(r *bufio.Reader) (frame []byte, m *message, err error) {
 	return nil, m, nil
 }
 
+// readLine reads one line without its CRLF/LF terminator.
 func readLine(r *bufio.Reader) (string, error) {
 	s, err := r.ReadString('\n')
 	if err != nil {
@@ -68,6 +70,7 @@ func readLine(r *bufio.Reader) (string, error) {
 	return strings.TrimRight(s, "\r\n"), nil
 }
 
+// get returns the first value of header k, or "".
 func (m *message) get(k string) string {
 	for _, h := range m.headers {
 		if strings.EqualFold(h.k, k) {
@@ -77,6 +80,7 @@ func (m *message) get(k string) string {
 	return ""
 }
 
+// values returns all values of header k (e.g. multiple WWW-Authenticate).
 func (m *message) values(k string) []string {
 	var out []string
 	for _, h := range m.headers {
@@ -87,6 +91,7 @@ func (m *message) values(k string) []string {
 	return out
 }
 
+// set replaces the first header k in place, or appends it.
 func (m *message) set(k, v string) {
 	for i, h := range m.headers {
 		if strings.EqualFold(h.k, k) {
@@ -97,6 +102,7 @@ func (m *message) set(k, v string) {
 	m.headers = append(m.headers, header{k, v})
 }
 
+// del removes every header k.
 func (m *message) del(k string) {
 	out := m.headers[:0]
 	for _, h := range m.headers {
@@ -107,6 +113,7 @@ func (m *message) del(k string) {
 	m.headers = out
 }
 
+// clone copies the header slice so edits don't affect the original (body is shared).
 func (m *message) clone() *message {
 	c := *m
 	c.headers = append([]header(nil), m.headers...)
@@ -115,6 +122,7 @@ func (m *message) clone() *message {
 
 func (m *message) isResponse() bool { return strings.HasPrefix(m.first, "RTSP/") }
 
+// status returns the response status code, or 0 for requests/malformed lines.
 func (m *message) status() int {
 	f := strings.Fields(m.first)
 	if len(f) < 2 {
@@ -124,6 +132,7 @@ func (m *message) status() int {
 	return n
 }
 
+// writeTo serializes the message in a single Write.
 func (m *message) writeTo(w io.Writer) error {
 	var b strings.Builder
 	b.WriteString(m.first + "\r\n")

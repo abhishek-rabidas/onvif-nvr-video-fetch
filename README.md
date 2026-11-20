@@ -24,6 +24,7 @@ Works with any NVR that implements ONVIF Profile G (Recording, Search and Replay
 9. [Troubleshooting](#troubleshooting)
 10. [Security notes](#security-notes)
 11. [Development](#development)
+12. [Author](#author)
 
 ---
 
@@ -331,3 +332,12 @@ make test                                   # both of the above
 ```
 
 Tests use fake NVRs (an `httptest` ONVIF server and a scripted RTSP server); no real device is required. See [`HOW_IT_WORKS.md`](HOW_IT_WORKS.md) for the internals (ONVIF client, RTSP replay proxy, ffmpeg pipeline).
+
+---
+
+## Author
+
+**Abhishek Kumar Rabidas**
+
+[![LinkedIn](https://img.shields.io/badge/LinkedIn-abhishek--kumar--rabidas-0A66C2?logo=linkedin&logoColor=white)](https://www.linkedin.com/in/abhishek-kumar-rabidas-428760166)
+[![GitHub](https://img.shields.io/badge/GitHub-abhishek--rabidas-181717?logo=github&logoColor=white)](https://github.com/abhishek-rabidas)

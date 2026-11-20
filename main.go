@@ -43,6 +43,7 @@ func main() {
 	}
 }
 
+// serve runs the HTTP API until ctx is cancelled (Ctrl+C / SIGTERM), then shuts down gracefully.
 func serve(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	var cfg api.Config
@@ -60,6 +61,7 @@ func serve(ctx context.Context, args []string) error {
 	return sc.Start(ctx, api.New(cfg))
 }
 
+// fetch is the CLI mode: -list prints channels, otherwise downloads one clip to -out.
 func fetch(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("nvrfetch", flag.ExitOnError)
 	r := footage.Request{Stderr: os.Stderr}

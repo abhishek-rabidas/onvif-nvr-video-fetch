@@ -17,28 +17,31 @@ import (
 	"com.flipkart.nvrvms/internal/digest"
 )
 
+// Config configures a Proxy for one replay session.
 type Config struct {
 	Upstream           string // rtsp://host[:port]/path?query (no userinfo)
 	Username, Password string
-	Start, End         time.Time
+	Start, End         time.Time     // replay range; sent to the NVR as UTC
 	RateControl        bool          // false => ask NVR to stream faster than real time
 	IdleTimeout        time.Duration // close when NVR sends nothing for this long
 	Logf               func(format string, args ...any)
 }
 
+// Proxy is a local RTSP listener on 127.0.0.1; each client connection gets its own upstream connection.
 type Proxy struct {
 	cfg       Config
 	ln        net.Listener
-	dialAddr  string
+	dialAddr  string // host:port to dial (default RTSP port 554 if the URI has none)
 	upBase    string // rtsp://host[:port] as in the upstream URI
 	localBase string // rtsp://127.0.0.1:port
-	path      string
+	path      string // path+query of the upstream URI, shared by local and upstream URLs
 
 	mu    sync.Mutex
-	conns map[net.Conn]struct{}
-	wg    sync.WaitGroup
+	conns map[net.Conn]struct{} // open client+upstream conns, closed by Close
+	wg    sync.WaitGroup        // accept loop + per-connection handlers
 }
 
+// Start listens on a random loopback port and begins proxying to cfg.Upstream.
 func Start(cfg Config) (*Proxy, error) {
 	if cfg.IdleTimeout == 0 {
 		cfg.IdleTimeout = 20 * time.Second
@@ -49,6 +52,7 @@ func Start(cfg Config) (*Proxy, error) {
 	if !strings.HasPrefix(strings.ToLower(cfg.Upstream), "rtsp://") {
 		return nil, fmt.Errorf("unsupported replay URI %q", cfg.Upstream)
 	}
+	// Split manually rather than url.Parse so the path/query is preserved byte-for-byte.
 	after := cfg.Upstream[len("rtsp://"):]
 	hostPart, path := after, "/"
 	if i := strings.IndexAny(after, "/?"); i >= 0 {
@@ -76,6 +80,8 @@ func Start(cfg Config) (*Proxy, error) {
 // URL is the local URL to hand to the RTSP client.
 func (p *Proxy) URL() string { return p.localBase + p.path }
 
+// Close stops accepting, closes all open connections (the client sees EOF and finishes
+// cleanly) and waits for handlers to exit. Safe to call more than once.
 func (p *Proxy) Close() error {
 	err := p.ln.Close()
 	p.mu.Lock()
@@ -87,6 +93,7 @@ func (p *Proxy) Close() error {
 	return err
 }
 
+// track registers (add) or forgets a connection so Close can interrupt it.
 func (p *Proxy) track(c net.Conn, add bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -97,6 +104,7 @@ func (p *Proxy) track(c net.Conn, add bool) {
 	}
 }
 
+// serve accepts client connections until the listener is closed.
 func (p *Proxy) serve() {
 	defer p.wg.Done()
 	for {
@@ -112,14 +120,16 @@ func (p *Proxy) serve() {
 	}
 }
 
+// session is one client connection paired with its upstream NVR connection.
 type session struct {
 	p          *Proxy
 	client, up net.Conn
-	cr, ur     *bufio.Reader
-	auth       *digest.Auth
-	offset     int // upstream CSeq = client CSeq + offset (grows with each auth retry)
+	cr, ur     *bufio.Reader // buffered readers for client and upstream
+	auth       *digest.Auth  // NVR credentials; the client's own Authorization is dropped
+	offset     int           // upstream CSeq = client CSeq + offset (grows with each auth retry)
 }
 
+// handle proxies one client connection: negotiate (phase 1) then stream (phase 2).
 func (p *Proxy) handle(client net.Conn) {
 	p.track(client, true)
 	defer func() { client.Close(); p.track(client, false) }()
@@ -147,6 +157,7 @@ func (p *Proxy) handle(client net.Conn) {
 }
 
 // negotiate relays the strictly sequential OPTIONS/DESCRIBE/SETUP/PLAY exchange.
+// Returns nil once PLAY succeeds, io.EOF on TEARDOWN.
 func (s *session) negotiate() error {
 	for {
 		frame, req, err := readMessage(s.cr)
@@ -178,6 +189,9 @@ func (s *session) negotiate() error {
 	}
 }
 
+// roundTrip sends req upstream and returns the (CSeq-mapped) response. On 401 it sets the
+// challenge and resends with the next CSeq (servers reject a reused CSeq), bumping offset
+// so later client CSeqs stay ahead of upstream ones.
 func (s *session) roundTrip(req *message) (*message, error) {
 	for attempt := 0; ; attempt++ {
 		if err := s.rewriteRequest(req).writeTo(s.up); err != nil {
@@ -221,6 +235,8 @@ func (s *session) readResponse() (*message, error) {
 	}
 }
 
+// rewriteRequest returns a copy of a client request adapted for the NVR: local → upstream URI,
+// shifted CSeq, NVR auth, and on PLAY the ONVIF replay headers.
 func (s *session) rewriteRequest(req *message) *message {
 	m := req.clone()
 	method, rest, _ := strings.Cut(m.first, " ")
@@ -237,6 +253,8 @@ func (s *session) rewriteRequest(req *message) *message {
 		m.set("Authorization", h)
 	}
 	if method == "PLAY" {
+		// ONVIF Streaming spec: absolute UTC range, replay mode required, optional
+		// Rate-Control: no for "as fast as possible".
 		const layout = "20060102T150405Z"
 		m.set("Range", "clock="+s.p.cfg.Start.UTC().Format(layout)+"-"+s.p.cfg.End.UTC().Format(layout))
 		m.set("Require", "onvif-replay")
@@ -247,6 +265,7 @@ func (s *session) rewriteRequest(req *message) *message {
 	return m
 }
 
+// rewriteResponse maps an upstream CSeq back to the client's numbering.
 func (s *session) rewriteResponse(m *message) {
 	if n, err := strconv.Atoi(m.get("CSeq")); err == nil {
 		m.set("CSeq", strconv.Itoa(n-s.offset))
@@ -258,12 +277,15 @@ func (s *session) stream() {
 	done := make(chan struct{}, 2)
 	go func() { s.upToClient(); done <- struct{}{} }()
 	go func() { s.clientToUp(); done <- struct{}{} }()
-	<-done
+	<-done // either direction ending ends the session
 	s.client.Close()
 	s.up.Close()
 	<-done
 }
 
+// upToClient forwards NVR → client: media frames, responses (CSeq mapped back) and server
+// requests. Ends on error or after IdleTimeout without data (NVRs often just stop sending
+// at the end of the range instead of closing).
 func (s *session) upToClient() {
 	w := bufio.NewWriterSize(s.client, 256<<10)
 	defer w.Flush()
@@ -290,6 +312,7 @@ func (s *session) upToClient() {
 			}
 			err = m.writeTo(w)
 		}
+		// Batch writes: flush only when no more upstream data is already buffered.
 		if err == nil && s.ur.Buffered() == 0 {
 			err = w.Flush()
 		}
@@ -299,6 +322,7 @@ func (s *session) upToClient() {
 	}
 }
 
+// clientToUp forwards client → NVR: RTCP frames as-is, requests (keep-alive, TEARDOWN) rewritten.
 func (s *session) clientToUp() {
 	for {
 		frame, m, err := readMessage(s.cr)

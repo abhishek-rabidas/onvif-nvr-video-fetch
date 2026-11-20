@@ -18,6 +18,7 @@ import (
 	"com.flipkart.nvrvms/internal/footage"
 )
 
+// Config holds server limits and auth.
 type Config struct {
 	MaxDuration   time.Duration // longest footage range per request
 	MaxConcurrent int           // simultaneous fetches (each runs one ffmpeg)
@@ -25,6 +26,7 @@ type Config struct {
 	TmpDir        string        // where MP4s are staged; "" = OS temp dir
 }
 
+// nvrParams are the NVR connection fields shared by all endpoints.
 type nvrParams struct {
 	IP       string `json:"ip"`
 	Port     int    `json:"port"`
@@ -32,6 +34,7 @@ type nvrParams struct {
 	Password string `json:"password"`
 }
 
+// footageRequest is the POST /api/v1/footage body.
 type footageRequest struct {
 	nvrParams
 	Channel        int    `json:"channel"`
@@ -42,6 +45,7 @@ type footageRequest struct {
 	Fast           bool   `json:"fast"`
 }
 
+// recordingDTO is one entry of the POST /api/v1/recordings response.
 type recordingDTO struct {
 	Channel     int    `json:"channel"`
 	Token       string `json:"token"`
@@ -52,9 +56,11 @@ type recordingDTO struct {
 
 type server struct {
 	cfg Config
-	sem chan struct{}
+	sem chan struct{} // concurrency slots; a full channel means 429
 }
 
+// New builds the Echo app. /healthz is always unauthenticated; /api/v1/* requires
+// X-API-Key when cfg.APIKey is set.
 func New(cfg Config) *echo.Echo {
 	if cfg.MaxConcurrent < 1 {
 		cfg.MaxConcurrent = 1
@@ -79,6 +85,8 @@ func New(cfg Config) *echo.Echo {
 	return e
 }
 
+// validate checks ip/port and defaults port to 80. ip must be a bare host so it
+// can't smuggle a path, credentials or another port into the ONVIF URL.
 func (p *nvrParams) validate() error {
 	if p.IP == "" || strings.ContainsAny(p.IP, "/?#@ ") {
 		return echo.NewHTTPError(http.StatusBadRequest, "ip is required and must be a bare IP/hostname")
@@ -92,6 +100,7 @@ func (p *nvrParams) validate() error {
 	return nil
 }
 
+// request builds a footage.Request whose logs are tagged with the HTTP request ID.
 func (p nvrParams) request(c *echo.Context) footage.Request {
 	id := c.Response().Header().Get(echo.HeaderXRequestID)
 	return footage.Request{
@@ -116,6 +125,7 @@ func (s *server) footage(c *echo.Context) error {
 		return echo.NewHTTPError(http.StatusBadRequest, "start and end are required")
 	}
 
+	// Non-blocking acquire: reject instead of queueing, since each fetch can run for an hour.
 	select {
 	case s.sem <- struct{}{}:
 		defer func() { <-s.sem }()
@@ -123,6 +133,8 @@ func (s *server) footage(c *echo.Context) error {
 		return echo.NewHTTPError(http.StatusTooManyRequests, "too many concurrent fetches, retry later")
 	}
 
+	// Per-request staging dir: ffmpeg needs a seekable file for +faststart, so the MP4
+	// can't be streamed to the client while it's being written.
 	dir, err := os.MkdirTemp(s.cfg.TmpDir, "nvrfetch-*")
 	if err != nil {
 		return err
@@ -147,6 +159,7 @@ func (s *server) footage(c *echo.Context) error {
 	h := c.Response().Header()
 	h.Set(echo.HeaderContentType, "video/mp4")
 	h.Set(echo.HeaderContentDisposition, `attachment; filename="`+name+`"`)
+	// FileFS with DirFS: Echo's default c.File filesystem rejects absolute paths outside CWD.
 	return c.FileFS("footage.mp4", os.DirFS(dir))
 }
 
@@ -170,6 +183,7 @@ func (s *server) recordings(c *echo.Context) error {
 	return c.JSON(http.StatusOK, out)
 }
 
+// mapErr: bad input (footage.ErrInvalid) → 400; NVR/network/ffmpeg failures → 502.
 func mapErr(err error) error {
 	if errors.Is(err, footage.ErrInvalid) {
 		return echo.NewHTTPError(http.StatusBadRequest, err.Error())

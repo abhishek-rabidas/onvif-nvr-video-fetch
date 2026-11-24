@@ -1,4 +1,4 @@
-module com.flipkart.nvrvms
+module com.github.abhishekrabidas
 
 go 1.27.2
 
